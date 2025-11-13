@@ -1,6 +1,14 @@
 import os
-from fastapi import FastAPI
+from io import BytesIO
+from typing import Optional
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+# Image processing
+from PIL import Image
+import numpy as np
 
 app = FastAPI()
 
@@ -12,13 +20,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+    return {"message": "Floture Detector API is running"}
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/detect")
+async def detect_floture(image: UploadFile = File(...)):
+    """
+    Simple heuristic detector for the fictional flower "floture".
+    We treat images dominated by vivid reds (like spider lilies) as positive.
+    Returns a confidence score in [0,1].
+    """
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image file")
+
+    try:
+        data = await image.read()
+        pil = Image.open(BytesIO(data)).convert("RGB")
+        # Resize for speed and normalization
+        pil_small = pil.copy()
+        pil_small.thumbnail((256, 256))
+        arr = np.asarray(pil_small).astype(np.float32)
+
+        # Compute red emphasis metric
+        r = arr[:, :, 0]
+        g = arr[:, :, 1]
+        b = arr[:, :, 2]
+
+        # Mask: red significantly higher than green/blue and reasonably bright
+        red_dominant = (r > g * 1.2) & (r > b * 1.2) & (r > 100)
+        red_ratio = float(red_dominant.mean()) if red_dominant.size > 0 else 0.0
+
+        # Additional saturation-like cue
+        max_rgb = np.maximum(np.maximum(r, g), b) + 1e-6
+        saturation = ((max_rgb - np.minimum(np.minimum(r, g), b)) / max_rgb)
+        sat_mean = float(saturation.mean())
+
+        # Combine metrics into confidence
+        conf = max(0.0, min(1.0, red_ratio * 2.0 * (0.5 + 0.5 * sat_mean)))
+
+        # Threshold for declaring "floture" present
+        detected = conf >= 0.35
+        result = {
+            "detected": detected,
+            "label": "floture" if detected else "unknown",
+            "confidence": round(conf, 3),
+            "metrics": {
+                "red_ratio": round(red_ratio, 4),
+                "saturation": round(sat_mean, 4),
+                "width": pil.width,
+                "height": pil.height,
+            },
+        }
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process image: {str(e)[:200]}")
+
 
 @app.get("/test")
 def test_database():
